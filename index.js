@@ -420,151 +420,117 @@ async function executeBackupLogic_Core(settings) {
     const currentTimestamp = Date.now();
     logDebug(`(封装) 开始执行核心备份逻辑 @ ${new Date(currentTimestamp).toLocaleTimeString()}`);
 
-    // 1. 获取当前上下文和关键信息
-    const context = getContext();
-    const chatKey = getCurrentChatKey();
+    const contextSnapshot = getContext(); // 获取一次快照
+    const chatKey = getCurrentChatKey(); // chatKey 仍然需要 contextSnapshot 或 getContext()
     if (!chatKey) {
         console.warn('[聊天自动备份] (封装) 无有效的聊天标识符，无法执行备份');
         return false;
     }
 
-    const { entityName, chatName } = getCurrentChatInfo();
-    let fullChatContentArray = null; 
-    let originalChatMessagesCount = 0;
+    const { entityName, chatName } = getCurrentChatInfo(); // 这个也需要 contextSnapshot 或 getContext()
+    let originalChatMessagesCount = 0; // 将在这里或从 Worker 返回后确定
 
     logDebug(`(封装) 准备备份聊天: ${entityName} - ${chatName}`);
 
-    // --- 使用getContext直接获取聊天数据 ---
+    // --- 步骤 1: 准备发送给 Worker 的数据【引用】 ---
+    let metadataRef;
+    let messagesRef;
+
     try {
-        if (context.groupId) { // 群组聊天
-            const group = context.groups?.find(g => g.id === context.groupId);
-            if (!group) {
-                throw new Error(`无法找到群组 ${context.groupId}`);
-            }
-            
-            logDebug(`[getContext] 获取群组 "${group.id}" 的聊天内容...`);
-            
-            // 正确地从group对象获取群组特定的元数据
-            let metadata = {};
-            const groupSpecificMetadataSource = group.chatMatedata || group.chat_metadata; 
-            if (groupSpecificMetadataSource && typeof groupSpecificMetadataSource === 'object') {
-                metadata = structuredClone(groupSpecificMetadataSource); // 深拷贝
-                logDebug(`[getContext] 从群组对象 (group.chatMatedata/chat_metadata) 获取到元数据，键数量: ${Object.keys(metadata).length}`);
+        if (contextSnapshot.groupId) {
+            const group = contextSnapshot.groups?.find(g => g.id === contextSnapshot.groupId);
+            const groupMeta = group ? (group.chatMatedata || group.chat_metadata) : null;
+            if (groupMeta && typeof groupMeta === 'object') {
+                metadataRef = groupMeta;
+            } else if (contextSnapshot.chatMetadata && typeof contextSnapshot.chatMetadata === 'object') {
+                metadataRef = contextSnapshot.chatMetadata;
+                 logDebug(`[getContext] 群组特定元数据未找到，使用 context.chatMetadata 作为备选`);
             } else {
-                logDebug(`[getContext] 警告: 群组 ${group.id} 的聊天特定元数据 (chatMatedata/chat_metadata) 无效或未找到，将使用空元数据对象`);
-                // 考虑是否需要从context.chatMetadata获取一些通用元数据作为备选
-                if (context.chatMetadata && typeof context.chatMetadata === 'object') {
-                    metadata = structuredClone(context.chatMetadata);
-                    logDebug(`[getContext] 从context.chatMetadata获取到备选元数据，键数量: ${Object.keys(metadata).length}`);
-                }
+                metadataRef = {};
+                logDebug(`[getContext] 群组特定元数据和备选均未找到，使用空元数据对象`);
             }
-            
-            // 从context获取消息内容
-            const messagesFromContext = context.chat || [];
-            if (!Array.isArray(messagesFromContext)) {
-                throw new Error(`群组 ${group.id} 的聊天消息数据类型错误，应为数组`);
-            }
-            
-            // 构造完整内容数组 [metadata, ...messages]
-            fullChatContentArray = [metadata, ...structuredClone(messagesFromContext)];
-            originalChatMessagesCount = messagesFromContext.length;
-            
-            logDebug(`[getContext] 已构造群组聊天完整内容数组，总长度: ${fullChatContentArray.length} (包含元数据)`);
-        } else if (context.characterId !== undefined) { // 角色聊天
-            const character = characters[context.characterId];
-            if (!character) {
-                throw new Error(`无法找到角色 ${context.characterId}`);
-            }
-            
-            // 从context获取角色聊天元数据
-            const metadata = context.chatMetadata || {};
-            
-            // 从context获取消息内容
-            const messages = context.chat || [];
-            if (!Array.isArray(messages)) {
-                throw new Error(`角色 ${character.name} 的聊天数据类型错误，应为数组`);
-            }
-            
-            // 构造完整内容数组 [metadata, ...messages]
-            fullChatContentArray = [structuredClone(metadata), ...structuredClone(messages)];
-            originalChatMessagesCount = messages.length;
-            
-            logDebug(`[getContext] 已构造角色聊天完整内容数组，总长度: ${fullChatContentArray.length} (包含元数据), 消息数: ${originalChatMessagesCount}`);
-         } else {
-            throw new Error("无法确定当前是角色还是群组聊天进行备份");
+        } else if (contextSnapshot.characterId !== undefined) {
+            metadataRef = contextSnapshot.chatMetadata || {};
+        } else {
+            console.error('[聊天自动备份] (封装) 无法确定当前是角色还是群组聊天进行备份，将使用空元数据');
+            metadataRef = {}; // 确保 metadataRef 有定义
         }
+        messagesRef = contextSnapshot.chat || [];
+        originalChatMessagesCount = messagesRef.length; // 在这里获取消息数
 
-        if (!fullChatContentArray || fullChatContentArray.length === 0) {
-            logDebug(`(封装) 从getContext获取的聊天内容为空或无效，取消备份。ChatKey: ${chatKey}`);
-            return false; // 如果获取不到内容，则不备份
+        // 简单验证是否有内容可备份 (基于消息数量)
+        if (messagesRef.length === 0 && Object.keys(metadataRef).length === 0) {
+             logDebug(`(封装) 从 getContext 获取的元数据和消息均为空，取消备份。ChatKey: ${chatKey}`);
+             return false;
         }
-        logDebug(`(封装) 从getContext获取到聊天内容，总条目数: ${fullChatContentArray.length}`);
+        logDebug(`(封装) 准备发送到 Worker: 元数据引用 (keys: ${Object.keys(metadataRef).length}), 消息引用 (count: ${messagesRef.length})`);
 
-    } catch (fetchError) {
-        console.error('[聊天自动备份] (封装) 获取聊天内容时出错:', fetchError);
-        toastr.error(`备份失败：无法获取聊天内容 - ${fetchError.message}`, '聊天自动备份');
-        return false; // 获取失败则不备份
+    } catch (dataPrepError) {
+        console.error('[聊天自动备份] (封装) 准备发送到 Worker 的数据时出错:', dataPrepError);
+        toastr.error(`备份失败：准备数据出错 - ${dataPrepError.message}`, '聊天自动备份');
+        return false;
     }
 
+    // --- lastMessagePreview 的计算需要在这里进行，基于引用 ---
     const lastMsgIndex = originalChatMessagesCount > 0 ? originalChatMessagesCount - 1 : -1;
-    const lastMessage = lastMsgIndex >= 0 && fullChatContentArray.length > 1 ? fullChatContentArray[lastMsgIndex+1] : null; // +1 因为元数据在前面
-    const lastMessagePreview = lastMessage?.mes?.substring(0, 100) || (originalChatMessagesCount > 0 ? '(消息内容获取失败)' : '(空聊天)');
+    const lastMessageObject = lastMsgIndex >= 0 && messagesRef.length > lastMsgIndex ? messagesRef[lastMsgIndex] : null;
+    const lastMessagePreview = lastMessageObject?.mes?.substring(0, 100) || (originalChatMessagesCount > 0 ? '(消息内容获取失败)' : '(空聊天)');
+
+
+    let copiedFullChatContentArray; // 这是 Worker 返回的结果 [metadata_clone, ...messages_clone]
 
     try {
-        // 2. 使用 Worker 进行深拷贝 (拷贝从getContext获取的 fullChatContentArray)
-        let copiedFullChatContentArray;
         if (backupWorker) {
-            try {
-                console.time('[聊天自动备份] Web Worker 深拷贝时间');
-                logDebug('(封装) 请求 Worker 执行深拷贝 fullChatContentArray...');
-                const metadata = fullChatContentArray[0];
-                const messages = fullChatContentArray.slice(1);
-                copiedFullChatContentArray = await performDeepCopyInWorker(metadata, messages);
-                console.timeEnd('[聊天自动备份] Web Worker 深拷贝时间');
-                logDebug('(封装) 从 Worker 收到拷贝后的 fullChatContentArray');
-            } catch(workerError) {
-                 console.error('[聊天自动备份] (封装) Worker 深拷贝失败，将尝试在主线程执行:', workerError);
-                  console.time('[聊天自动备份] 主线程深拷贝时间 (Worker失败后)');
-                  try { copiedFullChatContentArray = structuredClone(fullChatContentArray); }
-                  catch (scError) { copiedFullChatContentArray = JSON.parse(JSON.stringify(fullChatContentArray));}
-                  console.timeEnd('[聊天自动备份] 主线程深拷贝时间 (Worker失败后)');
-            }
+            console.time('[聊天自动备份] Web Worker 处理时间 (postMessage + Worker内部构造)');
+            logDebug('(封装) 请求 Worker 处理数据 (传递引用)...');
+            // --- 步骤 2: 调用 Worker，传递【引用】 ---
+            copiedFullChatContentArray = await performDeepCopyInWorker(metadataRef, messagesRef);
+            console.timeEnd('[聊天自动备份] Web Worker 处理时间 (postMessage + Worker内部构造)');
+            logDebug('(封装) 从 Worker 收到处理后的 finalChatFileContent');
         } else {
-            console.time('[聊天自动备份] 主线程深拷贝时间 (无Worker)');
-             try { copiedFullChatContentArray = structuredClone(fullChatContentArray); }
-             catch (scError) { copiedFullChatContentArray = JSON.parse(JSON.stringify(fullChatContentArray));}
-            console.timeEnd('[聊天自动备份] 主线程深拷贝时间 (无Worker)');
+            // --- Worker 不可用，主线程回退 ---
+            console.warn('[聊天自动备份] (封装) Worker 不可用，在主线程执行深拷贝和构造...');
+            console.time('[聊天自动备份] 主线程深拷贝和构造时间 (无Worker)');
+            const clonedMetadataMainThread = structuredClone(metadataRef);
+            const clonedMessagesMainThread = structuredClone(messagesRef);
+            copiedFullChatContentArray = [clonedMetadataMainThread, ...clonedMessagesMainThread];
+            console.timeEnd('[聊天自动备份] 主线程深拷贝和构造时间 (无Worker)');
         }
 
-        if (!copiedFullChatContentArray) {
-             throw new Error("未能获取有效的聊天数据副本 (fullChatContentArray)");
+        if (!copiedFullChatContentArray || !Array.isArray(copiedFullChatContentArray) || copiedFullChatContentArray.length === 0) {
+             throw new Error("未能从 Worker 或主线程回退中获取有效的聊天数据副本");
         }
+        // originalChatMessagesCount 应该从 copiedFullChatContentArray[1...] 的长度再次确认，或者信任 Worker 的构造
+        // 但由于我们已在前面从 messagesRef 获取了 originalChatMessagesCount，这里可以沿用
 
-        // 3. 构建备份对象
+    } catch (processingError) { // 捕获 Worker 错误或主线程回退错误
+        console.error('[聊天自动备份] (封装) Worker 处理或主线程回退深拷贝时出错:', processingError);
+        toastr.error(`备份失败：数据处理错误 - ${processingError.message}`, '聊天自动备份');
+        return false;
+    }
+    
+    // --- 后续逻辑 (构建备份对象、保存、清理) 基于 copiedFullChatContentArray ---
+    try {
         const backup = {
             timestamp: currentTimestamp,
-            chatKey, // 保持 chatKey 用于识别备份属于哪个原始聊天
+            chatKey,
             entityName,
             chatName,
-            lastMessageId: lastMsgIndex, // 基于消息数量
-            lastMessagePreview,
-            // 存储完整的聊天文件内容数组
-            chatFileContent: copiedFullChatContentArray, // [metadata, ...messages]
+            lastMessageId: lastMsgIndex, // 使用之前基于引用的计算
+            lastMessagePreview,       // 使用之前基于引用的计算
+            chatFileContent: copiedFullChatContentArray,
         };
         logDebug(`(封装) 构建的备份对象:`, {timestamp: backup.timestamp, chatKey: backup.chatKey, entityName: backup.entityName, chatName: backup.chatName, lastMessageId: backup.lastMessageId, preview: backup.lastMessagePreview, contentItems: backup.chatFileContent.length });
 
-        // 4. 检查当前聊天是否已有基于最后消息ID的备份 (避免完全相同的备份)
         const existingBackups = await getBackupsForChat(chatKey);
-        const existingBackupIndex = existingBackups.findIndex(b => b.lastMessageId === lastMsgIndex && b.lastMessageId !== -1); // 只有在有消息时才比较
+        const existingBackupIndex = existingBackups.findIndex(b => b.lastMessageId === lastMsgIndex && b.lastMessageId !== -1);
         let needsSave = true;
 
         if (lastMsgIndex !== -1 && existingBackupIndex !== -1) {
             const existingTimestamp = existingBackups[existingBackupIndex].timestamp;
             if (backup.timestamp > existingTimestamp) {
-                logDebug(`(封装) 发现旧备份 (ID ${lastMsgIndex}, 时间 ${existingTimestamp}), 将删除旧的以保存新的 (时间 ${backup.timestamp})`);
                 await deleteBackup(chatKey, existingTimestamp);
             } else {
-                logDebug(`(封装) 发现更新或相同的备份 (ID ${lastMsgIndex}, 时间 ${existingTimestamp} vs ${backup.timestamp}), 跳过保存`);
                 needsSave = false;
             }
         }
@@ -574,31 +540,25 @@ async function executeBackupLogic_Core(settings) {
             return false;
         }
 
-        // 5. 保存新的备份
         await saveBackupToDB(backup);
         logDebug(`(封装) 新备份已保存: [${chatKey}, ${backup.timestamp}]`);
 
-        // 6. 清理旧备份
-        logDebug(`(封装) 检查备份总数是否超出系统限制 (${settings.maxTotalBackups})`);
         const allBackupKeys = await getAllBackupKeys();
         if (allBackupKeys.length > settings.maxTotalBackups) {
-            logDebug(`(封装) 备份总数 (${allBackupKeys.length}) 超出限制 (${settings.maxTotalBackups})`);
             allBackupKeys.sort((a, b) => a[1] - b[1]);
             const numToDelete = allBackupKeys.length - settings.maxTotalBackups;
             const keysToDelete = allBackupKeys.slice(0, numToDelete);
-            logDebug(`(封装) 准备删除 ${keysToDelete.length} 个最旧的备份`);
             await Promise.all(keysToDelete.map(key => deleteBackup(key[0], key[1])));
             logDebug(`(封装) ${keysToDelete.length} 个旧备份已删除`);
-        } else {
-            logDebug(`(封装) 备份总数 (${allBackupKeys.length}) 未超出限制，无需清理`);
         }
 
         logDebug(`(封装) 聊天备份和潜在清理成功: ${entityName} - ${chatName}`);
         return true;
 
-    } catch (error) {
-        console.error('[聊天自动备份] (封装) 核心备份或清理过程中发生严重错误:', error);
-        throw error;
+    } catch (saveError) {
+        console.error('[聊天自动备份] (封装) 保存备份或清理过程中发生严重错误:', saveError);
+        toastr.error(`备份失败：保存或清理错误 - ${saveError.message}`, '聊天自动备份');
+        throw saveError; // 重新抛出，让 performBackupConditional 捕获
     }
 }
 
